@@ -29,10 +29,12 @@ import (
 const defaultAPIBase = "https://wangcheng.culturalcloud.net"
 
 var (
-	apiBase string
-	token   string
-	client  = &http.Client{Timeout: 15 * time.Second}
-	reader  = bufio.NewReader(os.Stdin)
+	apiBase  string
+	token    string // 生效 token, authGet/authPost 读取
+	envToken string // 启动时捕获的 VENUE_TOKEN; 非空则整会话覆盖
+	cfg      *Config
+	client   = &http.Client{Timeout: 15 * time.Second}
+	reader   = bufio.NewReader(os.Stdin)
 )
 
 // --------------- 数据结构 ---------------
@@ -103,28 +105,158 @@ type DictItem struct {
 	Value string `json:"value"`
 }
 
-// --------------- Token 持久化 ---------------
+// Account 一个已保存的登录账号, Phone 为唯一键
+type Account struct {
+	Phone      string `json:"phone"` // 11 位手机号, 或 legacyPhoneKey
+	Token      string `json:"token"`
+	CreatedAt  string `json:"created_at"`             // time.RFC3339
+	LastUsedAt string `json:"last_used_at,omitempty"` // time.RFC3339, 登录/切换时更新
+}
+
+// Config ~/.venue-cli/config.json 的根结构
+type Config struct {
+	Current  string    `json:"current"` // 当前账号的 Phone; "" = 无
+	Accounts []Account `json:"accounts"`
+}
+
+// --------------- 账号配置持久化 ---------------
+
+const (
+	legacyPhoneKey  = "__legacy__"       // 迁移导入的旧 token 无手机号
+	legacyTokenName = ".venue-cli-token" // 旧版文件名 (cwd 与 home 同名)
+)
 
 func tokenFilePath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".venue-cli-token")
+	return filepath.Join(home, legacyTokenName)
 }
 
-func saveToken(t string) {
-	os.WriteFile(tokenFilePath(), []byte(t), 0600)
+func configFilePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".venue-cli", "config.json")
 }
 
-func loadToken() string {
-	// 优先从当前目录加载
-	if data, err := os.ReadFile(".venue-cli-token"); err == nil {
-		return strings.TrimSpace(string(data))
-	}
-	// 再从 home 目录加载
-	data, err := os.ReadFile(tokenFilePath())
-	if err != nil {
+func nowRFC3339() string {
+	return time.Now().Format(time.RFC3339)
+}
+
+func formatTimeRFC3339(s string) string {
+	if s == "" {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return s
+	}
+	return t.Format("2006-01-02 15:04")
+}
+
+func maskPhone(phone string) string {
+	if len(phone) != 11 {
+		return phone
+	}
+	return phone[:3] + "****" + phone[7:]
+}
+
+func accountLabel(phone string) string {
+	switch phone {
+	case legacyPhoneKey:
+		return "默认账号(旧token迁移)"
+	case "":
+		return "无"
+	}
+	return maskPhone(phone)
+}
+
+// readLegacyToken 读取旧版单 token 文件, cwd 优先 (与旧 loadToken 顺序一致)
+func readLegacyToken() string {
+	for _, p := range []string{legacyTokenName, tokenFilePath()} {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if t := strings.TrimSpace(string(data)); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+func saveConfig(c *Config) error {
+	if err := os.MkdirAll(filepath.Dir(configFilePath()), 0700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configFilePath(), data, 0600)
+}
+
+// loadConfig 加载多账号配置; 仅当配置文件不存在时执行一次性旧 token 迁移
+func loadConfig() *Config {
+	c := &Config{}
+	path := configFilePath()
+
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if json.Unmarshal(data, c) == nil {
+			return c
+		}
+		// 损坏: 备份后从零开始 (文件存在过, 不再迁移)
+		fmt.Printf("  ⚠ 配置文件损坏, 已备份为 %s.bak\n", path)
+		if renErr := os.Rename(path, path+".bak"); renErr != nil {
+			fmt.Printf("  ⚠ 备份失败: %v\n", renErr)
+		}
+		return c
+	}
+	if !os.IsNotExist(err) {
+		fmt.Printf("  ⚠ 读取配置失败: %v\n", err)
+		return c
+	}
+
+	// 配置文件不存在 → 尝试一次性迁移旧版单 token 文件
+	tok := readLegacyToken()
+	if tok == "" {
+		return c
+	}
+	c.Accounts = []Account{{Phone: legacyPhoneKey, Token: tok, CreatedAt: nowRFC3339()}}
+	c.Current = legacyPhoneKey
+	if err := saveConfig(c); err != nil {
+		fmt.Printf("  ⚠ 迁移保存失败(本会话仍可用): %v\n", err)
+	} else {
+		fmt.Println("  ✓ 已迁移旧版 token 为「默认账号」，原文件已保留")
+	}
+	return c
+}
+
+func currentAccount(c *Config) *Account {
+	for i := range c.Accounts {
+		if c.Accounts[i].Phone == c.Current {
+			return &c.Accounts[i]
+		}
+	}
+	return nil
+}
+
+// upsertAccount 保存账号; 同手机号已存在则原地刷新 token (保留 CreatedAt)
+func upsertAccount(c *Config, phone, tok string) {
+	for i := range c.Accounts {
+		if c.Accounts[i].Phone == phone {
+			c.Accounts[i].Token = tok
+			return
+		}
+	}
+	c.Accounts = append(c.Accounts, Account{Phone: phone, Token: tok, CreatedAt: nowRFC3339()})
+}
+
+func removeAccount(c *Config, phone string) {
+	for i := range c.Accounts {
+		if c.Accounts[i].Phone == phone {
+			c.Accounts = append(c.Accounts[:i], c.Accounts[i+1:]...)
+			return
+		}
+	}
 }
 
 // --------------- HTTP 工具 ---------------
@@ -410,9 +542,17 @@ func doLogin() {
 		return
 	}
 
+	upsertAccount(cfg, phone, t)
+	cfg.Current = phone
+	if err := saveConfig(cfg); err != nil {
+		fmt.Printf("  ⚠ 保存配置失败: %v\n", err)
+	}
+	if envToken != "" {
+		fmt.Println("  ✓ 登录成功! 账号已保存; VENUE_TOKEN 覆盖中，本会话仍使用环境变量 token")
+		return
+	}
 	token = t
-	saveToken(token)
-	fmt.Println("  ✓ 登录成功! Token 已保存到 ~/.venue-cli-token")
+	fmt.Printf("  ✓ 登录成功! 当前账号: %s\n", accountLabel(phone))
 }
 
 // --------------- 业务逻辑 ---------------
@@ -1068,6 +1208,101 @@ func doCheckIn() {
 	}
 }
 
+// --------------- 账号管理 ---------------
+
+func accountMenu() {
+	for {
+		fmt.Println("\n── 账号管理 ──")
+		if envToken != "" {
+			fmt.Println("  ⚠ VENUE_TOKEN 环境变量生效中: API 使用环境变量 token，切换/登录仅保存，下次启动生效")
+		}
+		if len(cfg.Accounts) == 0 {
+			fmt.Println("  (暂无账号)")
+		} else {
+			for i, a := range cfg.Accounts {
+				mark := " "
+				if a.Phone == cfg.Current {
+					mark = "*"
+				}
+				line := fmt.Sprintf("  %d. [%s] %s", i+1, mark, accountLabel(a.Phone))
+				if a.LastUsedAt != "" {
+					line += "  最近使用 " + formatTimeRFC3339(a.LastUsedAt)
+				}
+				fmt.Println(line)
+			}
+		}
+
+		fmt.Println("\n  [l] 登录新账号")
+		fmt.Println("  [d] 删除账号")
+		fmt.Println("  [q] 返回")
+		fmt.Println()
+
+		choice := prompt("  请选择: ")
+		switch choice {
+		case "q", "Q":
+			return
+		case "l", "L":
+			doLogin()
+		case "d", "D":
+			deleteAccount()
+		default:
+			idx, err := strconv.Atoi(choice)
+			if err != nil || idx < 1 || idx > len(cfg.Accounts) {
+				fmt.Println("  无效输入")
+				continue
+			}
+			switchAccount(&cfg.Accounts[idx-1])
+		}
+	}
+}
+
+func switchAccount(a *Account) {
+	if a.Phone == cfg.Current {
+		fmt.Println("  当前已是该账号")
+		return
+	}
+	cfg.Current = a.Phone
+	a.LastUsedAt = nowRFC3339()
+	if err := saveConfig(cfg); err != nil {
+		fmt.Printf("  ⚠ 保存配置失败: %v\n", err)
+	}
+	if envToken != "" {
+		fmt.Printf("  ✓ 已保存切换至 %s（VENUE_TOKEN 覆盖中，本会话 token 不变）\n", accountLabel(a.Phone))
+		return
+	}
+	token = a.Token
+	fmt.Printf("  ✓ 已切换至 %s\n", accountLabel(a.Phone))
+}
+
+func deleteAccount() {
+	if len(cfg.Accounts) == 0 {
+		fmt.Println("  暂无账号")
+		return
+	}
+	idx, err := promptInt("\n  输入要删除的编号: ")
+	if err != nil || idx < 1 || idx > len(cfg.Accounts) {
+		fmt.Println("  无效输入")
+		return
+	}
+	acct := cfg.Accounts[idx-1]
+	confirm := prompt(fmt.Sprintf("  确认删除 %s? (y/n): ", accountLabel(acct.Phone)))
+	if confirm != "y" && confirm != "Y" {
+		fmt.Println("  已取消")
+		return
+	}
+	removeAccount(cfg, acct.Phone)
+	if cfg.Current == acct.Phone {
+		cfg.Current = ""
+		if envToken == "" {
+			token = ""
+		}
+	}
+	if err := saveConfig(cfg); err != nil {
+		fmt.Printf("  ⚠ 保存配置失败: %v\n", err)
+	}
+	fmt.Printf("  ✓ 已删除 %s\n", accountLabel(acct.Phone))
+}
+
 // --------------- 主流程 ---------------
 
 func main() {
@@ -1077,15 +1312,28 @@ func main() {
 	}
 	apiBase = strings.TrimRight(apiBase, "/")
 
-	token = os.Getenv("VENUE_TOKEN")
-	if token == "" {
-		token = loadToken()
-	}
-
 	fmt.Println("╔══════════════════════════════════════╗")
 	fmt.Println("║         场 馆 预 约 工 具            ║")
 	fmt.Println("╚══════════════════════════════════════╝")
+
+	envToken = os.Getenv("VENUE_TOKEN")
+	cfg = loadConfig()
+	if envToken != "" {
+		token = envToken
+	} else if a := currentAccount(cfg); a != nil {
+		token = a.Token
+	}
+
 	fmt.Printf("  API: %s\n", apiBase)
+	label := "无"
+	if a := currentAccount(cfg); a != nil {
+		label = accountLabel(a.Phone)
+	}
+	if envToken != "" {
+		fmt.Printf("  账号: %s (VENUE_TOKEN 覆盖中)\n", label)
+	} else {
+		fmt.Printf("  账号: %s\n", label)
+	}
 	if token != "" {
 		fmt.Println("  状态: 已登录")
 	} else {
@@ -1094,10 +1342,14 @@ func main() {
 
 	for {
 		printLine()
+		if a := currentAccount(cfg); a != nil {
+			fmt.Printf("  当前账号: %s\n", accountLabel(a.Phone))
+		}
 		fmt.Println("\n[1] 预约场馆")
 		fmt.Println("[2] 查看预约记录")
 		fmt.Println("[3] 签到（核销）")
 		fmt.Println("[4] 登录 (手机号+验证码)")
+		fmt.Println("[5] 账号管理")
 		fmt.Println("[q] 退出")
 		fmt.Println()
 
@@ -1123,6 +1375,8 @@ func main() {
 			doCheckIn()
 		case "4":
 			doLogin()
+		case "5":
+			accountMenu()
 		case "q", "Q":
 			fmt.Println("再见!")
 			return
