@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"math/rand"
@@ -228,6 +229,22 @@ func loadConfig() *Config {
 		fmt.Println("  ✓ 已迁移旧版 token 为「默认账号」，原文件已保留")
 	}
 	return c
+}
+
+// loadConfigReadOnly 只读加载配置: 不迁移、不改名备份, 供一次性任务(cron)使用, 避免与交互会话竞争写盘
+func loadConfigReadOnly() (*Config, error) {
+	data, err := os.ReadFile(configFilePath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("未找到配置 %s, 请先运行 venue-cli 登录", configFilePath())
+		}
+		return nil, fmt.Errorf("读取配置失败: %w", err)
+	}
+	var c Config
+	if err := json.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("配置损坏 %s: %w", configFilePath(), err)
+	}
+	return &c, nil
 }
 
 func currentAccount(c *Config) *Account {
@@ -1064,6 +1081,8 @@ func statusText(s int) string {
 	return "未知"
 }
 
+// fetchRecords 拉取最近一页预约记录; 每账号每天限约2小时场地, 记录很少, 最近一页即可覆盖当天
+// 检查业务码: 过期 token 返回 code!=0, 不能被误当成"无记录"
 func fetchRecords() ([]BookingRecord, int64, error) {
 	path := "/admin/api/member/venueSpace/page?current=1&size=20"
 	var resp struct {
@@ -1076,6 +1095,9 @@ func fetchRecords() ([]BookingRecord, int64, error) {
 	}
 	if err := authGet(path, &resp); err != nil {
 		return nil, 0, err
+	}
+	if resp.Code != 0 {
+		return nil, 0, fmt.Errorf("接口返回 code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return resp.Data.Records, resp.Data.Total, nil
 }
@@ -1118,6 +1140,40 @@ func getBookingDetail(recordID string) (*BookingRecord, error) {
 		return nil, fmt.Errorf("%s", resp.Msg)
 	}
 	return resp.Data, nil
+}
+
+// resolveLocation 获取签到经纬度 (默认签到位置，可通过环境变量 VENUE_LAT/VENUE_LNG 覆盖)
+func resolveLocation() (lat, lng float64) {
+	lat = 28.275529
+	lng = 112.909235
+	if v := os.Getenv("VENUE_LAT"); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			lat = n
+		}
+	}
+	if v := os.Getenv("VENUE_LNG"); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			lng = n
+		}
+	}
+	return
+}
+
+// verifyBooking 提交核销 (加密 POST), 返回业务码与消息
+func verifyBooking(recordID string, lat, lng float64) (code int, msg string, err error) {
+	payload := map[string]any{
+		"recordId":  recordID,
+		"latitude":  lat,
+		"longitude": lng,
+	}
+	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := authPost("/admin/api/member/venueSpace/verify", payload, &result, true); err != nil {
+		return -1, "", err
+	}
+	return result.Code, result.Msg, nil
 }
 
 func doCheckIn() {
@@ -1171,19 +1227,7 @@ func doCheckIn() {
 	fmt.Printf("  时间: %s-%s\n", detail.StartTime[:5], detail.EndTime[:5])
 
 	// 获取经纬度 (默认签到位置，可通过环境变量覆盖)
-	lat := 28.275529
-	lng := 112.909235
-
-	if v := os.Getenv("VENUE_LAT"); v != "" {
-		if n, err := strconv.ParseFloat(v, 64); err == nil {
-			lat = n
-		}
-	}
-	if v := os.Getenv("VENUE_LNG"); v != "" {
-		if n, err := strconv.ParseFloat(v, 64); err == nil {
-			lng = n
-		}
-	}
+	lat, lng := resolveLocation()
 
 	confirm := prompt(fmt.Sprintf("\n  确认签到? (位置: %.6f, %.6f) (y/n) [y]: ", lat, lng))
 	if confirm == "n" || confirm == "N" {
@@ -1192,26 +1236,254 @@ func doCheckIn() {
 	}
 
 	// 提交核销
-	payload := map[string]any{
-		"recordId":  selected.ID,
-		"latitude":  lat,
-		"longitude": lng,
-	}
-
-	var result struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-	}
-	if err := authPost("/admin/api/member/venueSpace/verify", payload, &result, true); err != nil {
+	code, msg, err := verifyBooking(selected.ID, lat, lng)
+	if err != nil {
 		fmt.Printf("  ✗ 签到失败: %v\n", err)
 		return
 	}
 
-	if result.Code == 0 {
+	if code == 0 {
 		fmt.Println("\n  ✓ 签到成功!")
 	} else {
-		fmt.Printf("  ✗ 签到失败: %s\n", result.Msg)
+		fmt.Printf("  ✗ 签到失败: %s\n", msg)
 	}
+}
+
+// --------------- 定时签到（一次性任务） ---------------
+
+// clog 一次性任务日志: 时间戳 + 标签 + 内容 (平铺, 不用交互缩进)
+func clog(label, format string, args ...any) {
+	fmt.Printf("%s [%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), label, fmt.Sprintf(format, args...))
+}
+
+func checkinStatePath() string {
+	return filepath.Join(filepath.Dir(configFilePath()), "checkin-state.json")
+}
+
+// checkinState 已签到记录 (按日期去重); 服务端重复核销行为未知, 本地状态是幂等真源
+type checkinState struct {
+	Dates map[string]map[string]bool `json:"dates"` // "2006-01-02" -> recordId -> true
+}
+
+func loadCheckinState() *checkinState {
+	s := &checkinState{Dates: map[string]map[string]bool{}}
+	data, err := os.ReadFile(checkinStatePath())
+	if err != nil {
+		return s // 不存在 = 空状态
+	}
+	if err := json.Unmarshal(data, s); err != nil || s.Dates == nil {
+		clog("checkin", "⚠ 状态文件损坏, 按空状态继续: %v", err)
+		s.Dates = map[string]map[string]bool{}
+	}
+	return s
+}
+
+func (s *checkinState) prune(today string) {
+	for d := range s.Dates {
+		if d < today { // ISO 日期字典序即时间序
+			delete(s.Dates, d)
+		}
+	}
+}
+
+func (s *checkinState) has(date, id string) bool {
+	return s.Dates[date][id]
+}
+
+func (s *checkinState) mark(date, id string) {
+	if s.Dates[date] == nil {
+		s.Dates[date] = map[string]bool{}
+	}
+	s.Dates[date][id] = true
+}
+
+func (s *checkinState) save() error {
+	path := checkinStatePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// sessionWindow 解析可签到窗口 [开场-lead, 结束];
+// 必须用 ParseInLocation(time.Local), time.Parse 按 UTC 解析会把窗口偏移 8 小时
+func sessionWindow(r BookingRecord, lead time.Duration) (start, end time.Time, err error) {
+	day, err := time.ParseInLocation("2006-01-02", r.BookingDate, time.Local)
+	if err != nil {
+		return start, end, fmt.Errorf("日期 %q: %w", r.BookingDate, err)
+	}
+	parseHM := func(s string) (time.Time, error) {
+		if t, e := time.ParseInLocation("15:04:05", s, time.Local); e == nil {
+			return t, nil
+		}
+		return time.ParseInLocation("15:04", s, time.Local) // 防御: 缺秒字段
+	}
+	st, err := parseHM(r.StartTime)
+	if err != nil {
+		return start, end, fmt.Errorf("开始时间 %q: %w", r.StartTime, err)
+	}
+	et, err := parseHM(r.EndTime)
+	if err != nil {
+		return start, end, fmt.Errorf("结束时间 %q: %w", r.EndTime, err)
+	}
+	start = time.Date(day.Year(), day.Month(), day.Day(), st.Hour(), st.Minute(), st.Second(), 0, time.Local)
+	end = time.Date(day.Year(), day.Month(), day.Day(), et.Hour(), et.Minute(), et.Second(), 0, time.Local)
+	if end.Before(start) {
+		end = end.AddDate(0, 0, 1) // 跨午夜场次防御
+	}
+	return start.Add(-lead), end, nil
+}
+
+// msgIndicatesDone 服务端返回表示"已核销"类消息时计入去重 (关键词可按实际响应调整)
+func msgIndicatesDone(msg string) bool {
+	for _, kw := range []string{"已核销", "已签到", "已使用", "已完成", "重复"} {
+		if strings.Contains(msg, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// runCheckIn 一次性任务: 扫描全部账号当天场次, 临近开场窗口内自动签到; 返回进程退出码
+func runCheckIn(args []string) int {
+	fs := flag.NewFlagSet("checkin", flag.ContinueOnError)
+	lead := fs.Int("lead", 30, "开场前多少分钟进入可签到窗口")
+	dryRun := fs.Bool("dry-run", false, "只扫描并打印决策, 不提交核销")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 1
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "  ✗ 未知参数: %s\n", fs.Arg(0))
+		return 1
+	}
+	if *lead < 0 {
+		fmt.Fprintln(os.Stderr, "  ✗ --lead 不能为负数")
+		return 1
+	}
+	leadDur := time.Duration(*lead) * time.Minute
+
+	c, err := loadConfigReadOnly()
+	if err != nil {
+		clog("checkin", "✗ %v", err)
+		return 1
+	}
+	cfg = c // 本路径只读不写 cfg
+
+	state := loadCheckinState()
+	today := time.Now().Format("2006-01-02")
+	state.prune(today)
+	lat, lng := resolveLocation()
+
+	mode := ""
+	if *dryRun {
+		mode = " (dry-run)"
+	}
+	clog("checkin", "开始签到任务: API=%s, lead=%d分钟%s", apiBase, *lead, mode)
+
+	var accN, okN, outN, failN int
+	// 单线程逐账号; 忽略 VENUE_TOKEN, 只用配置里的 Token
+	for _, a := range c.Accounts {
+		if a.Token == "" {
+			continue
+		}
+		label := accountLabel(a.Phone)
+		accN++
+		token = a.Token // authGet/authPost 读全局 token, 单线程无竞态
+
+		// 最近一页即可: 每天限约2小时场地, 记录很少, 当天记录必在首页
+		records, _, err := fetchRecords()
+		if err != nil {
+			clog(label, "✗ 获取记录失败: %v", err)
+			failN++
+			continue
+		}
+
+		now := time.Now()
+		for _, r := range records {
+			if r.BookingDate != today {
+				continue // 非今天: 静默跳过
+			}
+			if r.Status != 1 {
+				if *dryRun {
+					clog(label, "· %s %s-%s 状态=%s, 跳过", r.BookingDate, r.StartTime[:5], r.EndTime[:5], statusText(r.Status))
+				}
+				continue
+			}
+			if state.has(r.BookingDate, r.ID) {
+				if *dryRun {
+					clog(label, "· %s - %s 已在签到记录, 跳过", r.VenueName, r.VenueSpaceName)
+				}
+				continue
+			}
+			start, end, werr := sessionWindow(r, leadDur)
+			if werr != nil {
+				// 时间解析失败: 永不盲发, 真实模式也打印
+				clog(label, "⚠ %s %s-%s 时间无法解析, 跳过: %v", r.BookingDate, r.StartTime, r.EndTime, werr)
+				continue
+			}
+			switch {
+			case now.Before(start): // 窗口未开 → 未到时间
+				if *dryRun {
+					clog(label, "· %s %s 未到时间 (开放于 %s)", r.VenueName, r.VenueSpaceName, start.Format("15:04"))
+				}
+				outN++
+			case now.After(end): // 已过期窗口
+				if *dryRun {
+					clog(label, "· %s %s 已过期窗口 (结束于 %s)", r.VenueName, r.VenueSpaceName, end.Format("15:04"))
+				}
+				outN++
+			default: // 窗口内 [开场-lead, 结束] 含边界
+				if *dryRun {
+					clog(label, "✓ %s - %s (%s %s-%s) 窗口内, 将签到", r.VenueName, r.VenueSpaceName, r.BookingDate, r.StartTime[:5], r.EndTime[:5])
+					okN++
+					continue
+				}
+				code, msg, verr := verifyBooking(r.ID, lat, lng)
+				if verr != nil {
+					clog(label, "✗ 签到失败 %s - %s: %v", r.VenueName, r.VenueSpaceName, verr)
+					failN++
+					continue
+				}
+				switch {
+				case code == 0:
+					state.mark(today, r.ID)
+					if serr := state.save(); serr != nil {
+						clog(label, "⚠ 状态保存失败: %v", serr)
+					}
+					clog(label, "✓ 签到成功 %s - %s (%s %s-%s)", r.VenueName, r.VenueSpaceName, r.BookingDate, r.StartTime[:5], r.EndTime[:5])
+					okN++
+				case msgIndicatesDone(msg):
+					state.mark(today, r.ID)
+					if serr := state.save(); serr != nil {
+						clog(label, "⚠ 状态保存失败: %v", serr)
+					}
+					clog(label, "✓ 已核销过, 记入去重: %s (%s)", r.VenueName, msg)
+					okN++
+				default:
+					clog(label, "✗ 签到失败 %s - %s: code=%d msg=%s", r.VenueName, r.VenueSpaceName, code, msg)
+					failN++
+				}
+			}
+		}
+	}
+
+	if *dryRun {
+		clog("checkin", "本轮(dry-run): 检查%d个账号, 窗口内可签到%d, 窗口外%d, 失败%d", accN, okN, outN, failN)
+	} else {
+		clog("checkin", "本轮: 检查%d个账号, 成功签到%d, 窗口外%d, 失败%d", accN, okN, outN, failN)
+	}
+	return 0
 }
 
 // --------------- 账号管理 ---------------
@@ -1311,12 +1583,41 @@ func deleteAccount() {
 
 // --------------- 主流程 ---------------
 
+func printUsage() {
+	fmt.Println(`场馆预约工具 - 命令行用法
+
+用法:
+  venue-cli                        交互式菜单
+  venue-cli checkin [--lead N] [--dry-run]
+                                   一次性定时签到任务 (扫描全部账号当天场次)
+      --lead N     开场前 N 分钟进入可签到窗口 (默认 30, 场馆规则)
+      --dry-run    只打印决策, 不提交核销
+      注: checkin 模式忽略 VENUE_TOKEN, 只使用配置文件里的账号
+
+crontab 示例 (每天 5-21 点, 每 20 分钟):
+  */20 5-21 * * * /path/to/venue-cli checkin >> ~/.venue-cli/checkin.log 2>&1`)
+}
+
 func main() {
 	apiBase = os.Getenv("VENUE_API_BASE")
 	if apiBase == "" {
 		apiBase = defaultAPIBase
 	}
 	apiBase = strings.TrimRight(apiBase, "/")
+
+	// 一次性任务分支: 必须在 banner/菜单之前, 保证完全非交互
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "checkin":
+			os.Exit(runCheckIn(os.Args[2:]))
+		case "-h", "--help", "help":
+			printUsage()
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "  ✗ 未知参数: %s (用法见 venue-cli help)\n", os.Args[1])
+			os.Exit(1)
+		}
+	}
 
 	fmt.Println("╔══════════════════════════════════════╗")
 	fmt.Println("║         场 馆 预 约 工 具            ║")
