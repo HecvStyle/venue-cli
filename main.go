@@ -441,8 +441,14 @@ func randString(n int) string {
 
 func prompt(msg string) string {
 	fmt.Print(msg)
-	text, _ := reader.ReadString('\n')
-	return strings.TrimSpace(text)
+	text, err := reader.ReadString('\n')
+	text = strings.TrimSpace(text)
+	if err != nil && text == "" {
+		// stdin 关闭/输入结束: 直接退出, 避免菜单循环空转
+		fmt.Println("\n输入结束，退出")
+		os.Exit(0)
+	}
+	return text
 }
 
 func promptInt(msg string) (int, error) {
